@@ -10,7 +10,6 @@ from openai import RateLimitError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
 from src.controller.registry.views import ActionModel
-from pydantic.v1 import BaseModel, Field
 from src.controller.views import *
 
 @dataclass
@@ -50,8 +49,8 @@ class AgentOutput(BaseModel):
 
     action: list[ActionModel] = Field(
         ...,
-        min_items=0,
-        max_items=10,                     # ← hard limit
+        min_length=0,
+        max_length=10,                    # ← hard limit
         description="Ordered list of 0-10 actions for this step."
     )
     @staticmethod
