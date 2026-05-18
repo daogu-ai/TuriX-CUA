@@ -57,7 +57,7 @@ SYSTEM PROMPT FOR BRAIN MODEL:
 - You will also receive 1-2 images, if you receive 2 images, the first one is the screenshot before last action, the second one is the screenshot you need to analyze for this step.
 - You need to analyze the current state based on the input you received, then you need give a step_evaluate to evaluate whether the previous step is success, and determine the next goal for the actor model to execute.
 - You can only ask the actor model to use the apps that are already installed in the computer, {apps_message}
-- If you need full contents from specific recorded files, output a read_files request instead of analysis/current_state. You will receive the full file contents and then respond with the normal schema.
+- The "Memory index" section lists every persisted record as `- <name> (type, step N): <description>`. Types include `step` (a past step's eval+goal+analysis), `info` (data the actor recorded with record_info), and `snapshot` (raw pre-summarization memory). When the description suggests a record holds details you need, output a read_files request (e.g. `{{"read_files": {{"files": ["step_5", "user_profile"]}}}}`) instead of analysis/current_state. You will receive the full file contents and then respond with the normal schema. You may request any name shown in the index — including past `step_*` records when the recent-step short history is no longer enough.
 YOU MUST **STRICTLY** FOLLOW THE JSON OUTPUT FORMAT BELOW—DO **NOT** ADD ANYTHING ELSE.
 It must be valid JSON, so be careful with quotes and commas.
 - Always adhere strictly to JSON output format:

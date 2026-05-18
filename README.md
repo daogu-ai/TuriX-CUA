@@ -62,8 +62,9 @@ For installation and permissions, follow `OpenCLaw_TuriX_skill/README.md`.
 
 ## 📰 Latest News
 
-**April 8, 2026** - 🚀 Introducing **TuriX SuperPower 3.0.0-alpha** for macOS (Apple Silicon):  
-[Download dmg(ONLY for mac)](https://turix-staging-apollo.sfo3.cdn.digitaloceanspaces.com/turix-app/desktop/releases/Turix-SuperPower_3.0.0-alpha_aarch64.dmg)
+**May 11, 2026** - Now can download **TuriX SuperAgent** from our [official web page](https://turix.ai).
+
+**April 8, 2026** - 🚀 Introducing **TuriX SuperPower 3.0.0-alpha** for macOS (Apple Silicon)
 
 This is our all-in-one productivity app that combines **TuriX CUA + CLI** in one workflow, and adds two new capabilities:
 - **TuriX-work** for everyday office execution and task orchestration
@@ -94,7 +95,7 @@ Ready to level up? Update your `config.json` and start automating—happy hackin
 ## 🖼️ Demos
 <p align="center"><strong>TuriX SuperPower App Demo</strong></p>
 <p align="center">
-   <img src="./doc/app_demo.jpg" width="1600" alt="TuriX SuperPower app demo">
+   <img src="./doc/app_demo.png" width="1600" alt="TuriX SuperPower app demo">
 </p>
 
 <h3 align="center">MacOS Demo</h3>

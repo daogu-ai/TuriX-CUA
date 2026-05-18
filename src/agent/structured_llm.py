@@ -127,8 +127,8 @@ class BrainOutput(BaseModel):
 class ActorOutput(BaseModel):
     action: List[ActionItem] = Field(
         ...,
-        min_items=0,
-        max_items=10,                     # ← hard limit
+        min_length=0,
+        max_length=10,                    # ← hard limit
         description="Ordered list of 0-10 actions for this step."
     )
 
@@ -174,7 +174,7 @@ class PlannerOutput(BaseModel):
         description="High-level plan in natural language without step IDs."
     )
     step_by_step_plan: List[Step] = Field(...,
-        min_items=1,
+        min_length=1,
         description="Ordered high-level plan objects, each must start with 'Step N'."
     )
 

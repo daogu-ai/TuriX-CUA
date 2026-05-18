@@ -363,7 +363,10 @@ class Agent:
         # Pending step lines should not participate in memory budget/summarization until finalized.
         self.pending_recent_memory = ''
         self.memory_snapshot_files: list[dict[str, Any]] = []
-        self.infor_memory = []
+        # Structured manifest of persisted records (info, step, snapshot).
+        # Each entry: {"file_name", "description", "type", "step_id"}.
+        # Legacy runs may have stored bare filenames; load_memory() normalizes.
+        self.infor_memory: list[dict[str, Any]] = []
         self.last_pid = None
         self.ask_for_help = False
         
@@ -413,6 +416,87 @@ class Agent:
         if self.pending_recent_memory:
             parts.append("Pending steps (not yet evaluated):\n" + self.pending_recent_memory)
         self.brain_memory = "\n\n".join(parts).strip()
+
+    def _normalize_memory_entry(self, entry: Any) -> Optional[dict]:
+        """Coerce legacy `infor_memory` strings into the structured dict shape."""
+        if isinstance(entry, dict):
+            file_name = str(entry.get("file_name") or entry.get("name") or "").strip()
+            if not file_name:
+                return None
+            return {
+                "file_name": file_name,
+                "description": str(entry.get("description") or "").strip(),
+                "type": str(entry.get("type") or "info").strip() or "info",
+                "step_id": entry.get("step_id"),
+            }
+        if isinstance(entry, str) and entry.strip():
+            return {
+                "file_name": entry.strip(),
+                "description": "",
+                "type": "info",
+                "step_id": None,
+            }
+        return None
+
+    def _upsert_memory_entry(
+        self,
+        file_name: str,
+        description: str = "",
+        record_type: str = "info",
+        step_id: Optional[int] = None,
+    ) -> None:
+        """Add or update an entry in the structured memory manifest (`infor_memory`)."""
+        if not file_name:
+            return
+        new_entry = {
+            "file_name": file_name,
+            "description": description or "",
+            "type": record_type or "info",
+            "step_id": step_id,
+        }
+        normalized: list[dict] = []
+        replaced = False
+        for raw in self.infor_memory:
+            entry = self._normalize_memory_entry(raw)
+            if entry is None:
+                continue
+            if entry["file_name"] == file_name:
+                normalized.append(new_entry)
+                replaced = True
+            else:
+                normalized.append(entry)
+        if not replaced:
+            normalized.append(new_entry)
+        self.infor_memory = normalized
+
+    def _format_memory_index(self, max_entries: int = 50) -> str:
+        """Render the memory index seen by the brain.
+
+        One line per record: `- <name> (type, step N): <description>`. The brain
+        uses this to decide whether to call `read_files`.
+        """
+        if not self.infor_memory:
+            return "None"
+        entries = []
+        for raw in self.infor_memory:
+            entry = self._normalize_memory_entry(raw)
+            if entry is not None:
+                entries.append(entry)
+        if not entries:
+            return "None"
+        # Most recent first — the brain cares more about new memories.
+        ordered = list(reversed(entries))[:max_entries]
+        lines = []
+        for e in ordered:
+            label_parts = [e["type"]]
+            if e["step_id"] is not None:
+                label_parts.append(f"step {e['step_id']}")
+            label = ", ".join(label_parts)
+            desc = e["description"] or "(no description)"
+            lines.append(f"- {e['file_name']} ({label}): {desc}")
+        if len(entries) > max_entries:
+            lines.append(f"... ({len(entries) - max_entries} older entries hidden)")
+        return "\n".join(lines)
 
     @property
     def total_memory_tokens(self) -> int:
@@ -556,7 +640,16 @@ class Agent:
             return None
         step_value = step_override if step_override is not None else self.n_steps
         safe_name = file_name or f"memory_snapshot_{source}_step_{step_value}.txt"
-        saved_name = self.memory_snapshot_store.save(memory_text, safe_name, step=step_value)
+        # Snapshots are pre-summarization raw text; tag them so the brain can
+        # distinguish a snapshot from a step/info record in the index.
+        description = f"Pre-summarization snapshot of {source} memory at step {step_value}"
+        saved_name = self.memory_snapshot_store.save(
+            memory_text,
+            safe_name,
+            step=step_value,
+            description=description,
+            record_type="snapshot",
+        )
         self.memory_snapshot_files.append(
             {
                 "file_name": saved_name,
@@ -565,6 +658,103 @@ class Agent:
             }
         )
         return saved_name
+
+    def _save_step_record(
+        self,
+        step_id: int,
+        eval_status: str,
+        goal: str,
+        analysis: Optional[str] = None,
+    ) -> None:
+        """Persist a single finalized step as a structured record.
+
+        Step records live in `self.record_store` alongside info records so they
+        appear in the same memory index. The brain can request any past step
+        record by name even if its summary has already been compressed.
+        """
+        if not goal:
+            return
+        body_lines = [f"Eval: {eval_status}", f"Goal: {goal}"]
+        if analysis:
+            body_lines.append("")
+            body_lines.append(f"Analysis: {analysis}")
+        body = "\n".join(body_lines)
+        short_goal = (goal or "").strip().splitlines()[0][:80]
+        description = f"Step {step_id} ({eval_status}): {short_goal}"
+        try:
+            saved = self.record_store.save(
+                body,
+                f"step_{step_id}",
+                step=step_id,
+                description=description,
+                record_type="step",
+            )
+        except Exception:
+            logger.exception("[Memory] Failed to persist step record for step %s.", step_id)
+            return
+        # Track in the manifest so the index stays in sync without rescanning disk.
+        self._upsert_memory_entry(
+            file_name=saved,
+            description=description,
+            record_type="step",
+            step_id=step_id,
+        )
+
+    def _sweep_orphaned_pending(self, current_step_id: int) -> int:
+        """Recover pending lines older than `current_step_id - 1`.
+
+        Pending lines normally clear within one brain cycle: step N's pending
+        line is finalized by step N+1's brain. When a brain step fails (e.g.,
+        API timeout), step N's pending line gets stranded — the next successful
+        brain finalizes its own prev_step_id, leaving anything older untouched.
+
+        Each orphan is promoted to recent_memory with `Eval: unknown` and a
+        stub step record is persisted so the recall index stays complete.
+        Returns the number of lines swept.
+        """
+        if not self.pending_recent_memory:
+            return 0
+        pending_lines = [ln for ln in self.pending_recent_memory.splitlines() if ln.strip()]
+        survivors: list[str] = []
+        orphans: list[tuple[int, str]] = []
+        for ln in pending_lines:
+            match = re.match(r"^Step (\d+) \|", ln)
+            if not match:
+                survivors.append(ln)
+                continue
+            orphan_step_id = int(match.group(1))
+            if orphan_step_id < current_step_id - 1:
+                goal_text = ln.split("| Goal: ", 1)[1].strip() if "| Goal: " in ln else ""
+                orphans.append((orphan_step_id, goal_text))
+            else:
+                survivors.append(ln)
+        if not orphans:
+            return 0
+
+        self.pending_recent_memory = "\n".join(survivors).strip()
+        recent_lines = [ln for ln in self.recent_memory.splitlines() if ln.strip()]
+        for orphan_step_id, goal_text in orphans:
+            recent_lines = [ln for ln in recent_lines if not ln.startswith(f"Step {orphan_step_id} |")]
+            recent_lines.append(f"Step {orphan_step_id} | Eval: unknown | Goal: {goal_text}")
+            prev_brain = self.brain_context.get(orphan_step_id) or {}
+            analysis_payload = prev_brain.get("analysis") if isinstance(prev_brain, dict) else None
+            if isinstance(analysis_payload, dict):
+                analysis_text = analysis_payload.get("analysis") or ""
+            else:
+                analysis_text = str(analysis_payload or "")
+            self._save_step_record(
+                step_id=orphan_step_id,
+                eval_status="unknown",
+                goal=goal_text,
+                analysis=analysis_text,
+            )
+        self.recent_memory = "\n".join(recent_lines).strip()
+        logger.warning(
+            "[Memory] Swept %d orphaned pending line(s) from prior brain failure(s): steps %s",
+            len(orphans),
+            [s for s, _ in orphans],
+        )
+        return len(orphans)
 
     async def _summarise_memory(self) -> None:
         """
@@ -630,21 +820,41 @@ class Agent:
         self._refresh_brain_memory()
 
     async def _update_memory(self) -> None:
+        """Add a pending entry for the current step.
+
+        Tag the line with `self.n_steps` (the iteration number we're executing)
+        rather than `max(brain_context.keys())`. The latter desyncs whenever a
+        brain step fails: brain_context skips that step, so the next actor's
+        pending line would overwrite the prior step's entry instead of creating
+        a new one — leaving prior pending lines stranded forever.
+
+        Also: when the actor's last action stored a record_info file, replace
+        the verbose goal text with a compact pointer to the saved file. The
+        goal text is otherwise duplicated by the file contents, which bloats
+        recent_memory and delays compression.
         """
-        Update memory content
-        """
+        step_id = self.n_steps
 
         sorted_steps = sorted(self.brain_context.keys(), reverse=True)
-        if not sorted_steps:
-            return
-        current_state = self.brain_context[sorted_steps[0]]['current_state']
-        # logger.debug(f"current_state: {current_state}")
-        step_goal = current_state['next_goal'] if current_state else None
-        # logger.debug(f"step_goal: {step_goal}")
-        step_id = sorted_steps[0]
+        if sorted_steps:
+            latest_state = self.brain_context[sorted_steps[0]].get('current_state') or {}
+            raw_goal = latest_state.get('next_goal') if isinstance(latest_state, dict) else None
+        else:
+            raw_goal = None
 
-        # Always write the current step as pending. The success/failed signal for step N
-        # arrives in brain_step() of step (N+1). Pending lines do not count toward budget.
+        recorded_files = [
+            entry.get("file_name")
+            for entry in self.infor_memory
+            if isinstance(entry, dict)
+            and entry.get("step_id") == step_id
+            and entry.get("type") == "info"
+            and entry.get("file_name")
+        ]
+        if recorded_files:
+            step_goal = "recorded info to " + ", ".join(recorded_files)
+        else:
+            step_goal = raw_goal
+
         line = f"Step {step_id} | Eval: pending | Goal: {step_goal}"
         pending_lines = [ln for ln in self.pending_recent_memory.splitlines() if ln.strip()]
         pending_lines = [ln for ln in pending_lines if not ln.startswith(f"Step {step_id} |")]
@@ -714,7 +924,29 @@ class Agent:
                 data = json.loads(lines[-1])
                 self.task = data.get("task", "")
                 self.last_pid = data.get("pid", None)
-                self.infor_memory = data.get("infor_memory", [])
+                # `infor_memory` may be the legacy list[str] of filenames or the
+                # structured list[dict] manifest. Normalize to dicts on load.
+                raw_manifest = data.get("infor_memory", []) or []
+                normalized_manifest: list[dict] = []
+                for raw in raw_manifest:
+                    entry = self._normalize_memory_entry(raw)
+                    if entry is not None:
+                        normalized_manifest.append(entry)
+                self.infor_memory = normalized_manifest
+                # Heal missing descriptions/types by reading frontmatter from disk.
+                for entry in self.infor_memory:
+                    if entry.get("description"):
+                        continue
+                    meta = self.record_store.read_metadata(entry["file_name"])
+                    if not meta:
+                        continue
+                    entry["description"] = meta.get("description") or entry.get("description") or ""
+                    entry["type"] = meta.get("type") or entry.get("type") or "info"
+                    if entry.get("step_id") is None and meta.get("step_id"):
+                        try:
+                            entry["step_id"] = int(meta.get("step_id"))
+                        except (TypeError, ValueError):
+                            pass
                 # self.state_memory = data.get("state_memory", None)
                 self.brain_context = data.get("brain_context", OrderedDict())
                 if self.brain_context:
@@ -819,7 +1051,7 @@ class Agent:
                 screenshot_dataurl = screenshot_to_dataurl(self.screenshot_annotated)
             if self.previous_screenshot:
                 previous_screenshot_dataurl = screenshot_to_dataurl(self.previous_screenshot)
-            info_files = "\n".join(str(item) for item in self.infor_memory) if self.infor_memory else "None"
+            memory_index = self._format_memory_index()
             def build_state_content(
                 read_files_content: Optional[str] = None,
                 read_files_list: Optional[list[str]] = None,
@@ -830,7 +1062,7 @@ class Agent:
                             "type": "text",
                             "content": (
                                 f"Previous step is {prev_step_id}.\n\n"
-                                f"Recorded info files (filenames only):\n{info_files}\n\n"
+                                f"Memory index (recall by name with read_files):\n{memory_index}\n\n"
                                 f"Previous Actions Short History:\n{self.brain_memory}\n\n"
                             )
                         }
@@ -891,6 +1123,7 @@ class Agent:
 
             # Finalize the previous step's memory line based on this response's evaluation signal.
             # Keep step N in pending_recent_memory until step (N+1) arrives, so it won't be summarized away.
+            promoted_count = 0
             if prev_step_id >= 1:
                 raw_eval = str(self.current_state.get("step_evaluate", "")).lower()
                 if "success" in raw_eval:
@@ -917,23 +1150,46 @@ class Agent:
                     recent_lines = [ln for ln in recent_lines if not ln.startswith(f"Step {prev_step_id} |")]
                     recent_lines.append(final_line)
                     self.recent_memory = "\n".join(recent_lines).strip()
-                    recent_tokens = self.token_counter.count(self.recent_memory)
-                    hard_limit = int(self.memory_budget_tokens * self.memory_hard_ratio)
-                    warn_limit = int(self.memory_budget_tokens * self.memory_warn_ratio)
-                    if recent_tokens > hard_limit:
-                        await self._summarise_recent_memory(step_override=prev_step_id)
-                    elif recent_tokens > warn_limit:
-                        logger.info(
-                            "[Memory] Recent memory at %.0f%% of budget (%d/%d tokens). Compression will trigger soon.",
-                            (recent_tokens / self.memory_budget_tokens) * 100,
-                            recent_tokens,
-                            self.memory_budget_tokens,
-                        )
-                        self._refresh_brain_memory()
+                    # Persist a structured step record so the brain can recall this
+                    # step by name even after it is summarized away from recent_memory.
+                    prev_brain = self.brain_context.get(prev_step_id) or {}
+                    prev_analysis_payload = prev_brain.get("analysis") if isinstance(prev_brain, dict) else None
+                    if isinstance(prev_analysis_payload, dict):
+                        prev_analysis_text = prev_analysis_payload.get("analysis") or ""
                     else:
-                        self._refresh_brain_memory()
+                        prev_analysis_text = str(prev_analysis_payload or "")
+                    self._save_step_record(
+                        step_id=prev_step_id,
+                        eval_status=final_status,
+                        goal=goal_text,
+                        analysis=prev_analysis_text,
+                    )
+                    promoted_count += 1
+
+            # Recover any pending lines orphaned by an earlier brain failure.
+            # Runs unconditionally so older orphans are caught even when this
+            # brain step had no prev_step_id pending line of its own.
+            promoted_count += self._sweep_orphaned_pending(current_step_id=step_id)
+
+            # Single compression check across everything we just promoted.
+            if promoted_count > 0:
+                recent_tokens = self.token_counter.count(self.recent_memory)
+                hard_limit = int(self.memory_budget_tokens * self.memory_hard_ratio)
+                warn_limit = int(self.memory_budget_tokens * self.memory_warn_ratio)
+                if recent_tokens > hard_limit:
+                    await self._summarise_recent_memory(step_override=prev_step_id)
+                elif recent_tokens > warn_limit:
+                    logger.info(
+                        "[Memory] Recent memory at %.0f%% of budget (%d/%d tokens). Compression will trigger soon.",
+                        (recent_tokens / self.memory_budget_tokens) * 100,
+                        recent_tokens,
+                        self.memory_budget_tokens,
+                    )
+                    self._refresh_brain_memory()
                 else:
                     self._refresh_brain_memory()
+            else:
+                self._refresh_brain_memory()
             self._log_memory_metrics()
 
         except Exception as e:
@@ -1110,14 +1366,40 @@ class Agent:
             if outer_key == "record_info" and isinstance(inner_value, dict):
                 information_stored = inner_value.get("text", "")
                 file_name = inner_value.get("file_name", "")
+                # Description is resolved without burdening the actor model:
+                #   1. Heuristic from the recorded text (RecordStore picks the
+                #      first non-empty line).
+                #   2. If that yields nothing useful, fall back to the brain's
+                #      `next_goal` — a clean intent sentence the brain already
+                #      wrote describing what the actor was asked to record.
+                #   3. RecordStore's filename humanization is the final fallback.
+                heuristic = self.record_store.derive_description(
+                    information_stored, file_name or f"record_step_{self.n_steps}"
+                )
+                brain_intent = (self.next_goal or "").strip()
+                if brain_intent and (
+                    not heuristic
+                    or heuristic == "(no description)"
+                    or len(heuristic) < 12
+                ):
+                    description = brain_intent[:140].rstrip()
+                else:
+                    description = heuristic
                 saved_name = self.record_store.save(
                     information_stored,
                     file_name,
                     screenshot=self.screenshot_annotated,
                     step=self.n_steps,
+                    description=description,
+                    record_type="info",
                 )
-                if saved_name and saved_name not in self.infor_memory:
-                    self.infor_memory.append(saved_name)
+                if saved_name:
+                    self._upsert_memory_entry(
+                        file_name=saved_name,
+                        description=description,
+                        record_type="info",
+                        step_id=self.n_steps,
+                    )
             normalized_actions.append(action)
         parsed: AgentOutput | None = AgentOutput(action=normalized_actions)
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
+import io
 import logging
 from datetime import datetime
-from typing import Any, List, Optional, Type
+from typing import Any, List, Optional, Tuple, Type
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
@@ -13,6 +15,7 @@ from langchain_core.messages import (
 	ToolMessage,
 )
 from langchain_openai import ChatOpenAI
+from PIL import Image
 
 from src.agent.message_manager.views import MessageHistory, MessageMetadata
 from src.agent.prompts import AgentMessagePrompt, SystemPrompt
@@ -294,23 +297,49 @@ class MessageManager:
 		return tokens
 	
 	def _count_image_tokens(self, image_url: dict) -> int:
-		"""Calculate tokens for images based on OpenAI's token rules"""
+		"""Calculate tokens for images based on OpenAI's token rules.
+
+		For non-OpenAI models we use a flat IMG_TOKENS estimate. For OpenAI:
+		- detail='low' is a fixed 85 tokens.
+		- detail='high' (or unspecified) needs the real image dimensions to compute
+		  tiles. Dimensions are not present on the dict by default — decode the
+		  data URL with PIL when possible. Fall back to IMG_TOKENS if we can't.
+		"""
 		if not isinstance(self.llm, ChatOpenAI):
-			return self.IMG_TOKENS  # Default for other models
-		
-		detail = image_url.get('detail', 'low')
-		
+			return self.IMG_TOKENS
+
+		detail = image_url.get('detail', 'high')
 		if detail == 'low':
-			return 85  # Fixed token cost for low-res images
-		
-		# High-detail calculation (512x512 tiles)
-		width = image_url.get('width', 0)
-		height = image_url.get('height', 0)
-		
-		# Resize logic
+			return 85
+
+		width = image_url.get('width') or 0
+		height = image_url.get('height') or 0
+		if not (width and height):
+			width, height = self._extract_image_dimensions(image_url.get('url', ''))
+		if not (width and height):
+			return self.IMG_TOKENS
+
 		scaled_width, scaled_height = self._resize_dimensions(width, height)
 		tile_count = ((scaled_width + 511) // 512) * ((scaled_height + 511) // 512)
 		return 85 + (tile_count * 170)
+
+	def _extract_image_dimensions(self, url: str) -> Tuple[int, int]:
+		"""Decode a data URL header and read PIL dimensions. Returns (0,0) on failure.
+
+		Only handles base64-encoded data URLs (the only kind the agent emits today).
+		Remote URLs are not fetched — caller falls back to IMG_TOKENS.
+		"""
+		if not isinstance(url, str) or not url.startswith('data:image/'):
+			return (0, 0)
+		try:
+			header, _, payload = url.partition(',')
+			if 'base64' not in header or not payload:
+				return (0, 0)
+			raw = base64.b64decode(payload, validate=False)
+			with Image.open(io.BytesIO(raw)) as img:
+				return img.size  # (width, height)
+		except Exception:
+			return (0, 0)
 	
 	def _handle_embedded_images(self, text: str) -> int:
 		"""Count tokens for <image> markers in text content"""
@@ -345,43 +374,82 @@ class MessageManager:
 		if diff <= 0:
 			return None
 
+		# Stage 1: drop image items from the most recent message (multi-modal content).
+		# Iterate over a snapshot so we can mutate the underlying list safely.
 		msg = self.history.messages[-1]
 		if isinstance(msg.message.content, list):
-			text = ''
+			kept_items = []
 			for item in msg.message.content:
-				if 'image_url' in item:
-					msg.message.content.remove(item)
-					diff -= self.IMG_TOKENS
+				if (
+					diff > 0
+					and isinstance(item, dict)
+					and 'image_url' in item
+				):
 					msg.metadata.input_tokens -= self.IMG_TOKENS
 					self.history.total_tokens -= self.IMG_TOKENS
+					diff -= self.IMG_TOKENS
 					logger.debug(
-						f'Removed image with {self.IMG_TOKENS} tokens - total tokens now: {self.history.total_tokens}/{self.max_input_tokens}'
+						f'Removed image with {self.IMG_TOKENS} tokens - total tokens now: '
+						f'{self.history.total_tokens}/{self.max_input_tokens}'
 					)
-				elif 'text' in item and isinstance(item, dict):
-					text += item['text']
-			msg.message.content = text
-			self.history.messages[-1] = msg
+					continue
+				kept_items.append(item)
+			msg.message.content = kept_items
 
 		if diff <= 0:
 			return None
 
-		proportion_to_remove = diff / msg.metadata.input_tokens
+		# Stage 2: drop oldest non-protected history messages.
+		# `min_history_messages` is the count of system/task/tool-seed messages set up at
+		# init time. We only evict messages strictly after that prefix, and we evict the
+		# oldest first so the most recent context is preserved.
+		while diff > 0 and len(self.history.messages) > self.min_history_messages + 1:
+			oldest_idx = self.min_history_messages
+			oldest = self.history.messages[oldest_idx]
+			freed = oldest.metadata.input_tokens
+			self.history.messages.pop(oldest_idx)
+			self.history.total_tokens -= freed
+			diff -= freed
+			logger.debug(
+				f'Dropped oldest history message ({oldest.message.__class__.__name__}, '
+				f'{freed} tokens) - total now: {self.history.total_tokens}/{self.max_input_tokens}'
+			)
+
+		if diff <= 0:
+			return None
+
+		# Stage 3: last resort. Only truncate the tail message when it is a plain-string
+		# HumanMessage — truncating an AIMessage (may contain tool_calls / JSON) or a
+		# ToolMessage would corrupt the conversation. Preserve the original message class.
+		msg = self.history.messages[-1]
+		if not (isinstance(msg.message, HumanMessage) and isinstance(msg.message.content, str)):
+			raise ValueError(
+				'Max token limit reached - cannot safely truncate tail '
+				f'{msg.message.__class__.__name__}; reduce the system prompt or task.'
+			)
+
+		denom = max(1, msg.metadata.input_tokens)
+		proportion_to_remove = diff / denom
 		if proportion_to_remove > 0.99:
 			raise ValueError(
 				f'Max token limit reached - history is too long - reduce the system prompt or task. '
 				f'proportion_to_remove: {proportion_to_remove}'
 			)
 		logger.debug(
-			f'Removing {proportion_to_remove * 100:.2f}% of the last message  {proportion_to_remove * msg.metadata.input_tokens:.2f} / {msg.metadata.input_tokens:.2f} tokens)'
+			f'Removing {proportion_to_remove * 100:.2f}% of the last message '
+			f'({proportion_to_remove * denom:.2f} / {denom} tokens)'
 		)
 
 		content = msg.message.content
 		characters_to_remove = int(len(content) * proportion_to_remove)
-		content = content[:-characters_to_remove]
+		if characters_to_remove > 0:
+			content = content[:-characters_to_remove]
 		self.history.remove_message(index=-1)
-		msg = HumanMessage(content=content)
-		self._add_message_with_tokens(msg)
+		new_msg = HumanMessage(content=content)
+		self._add_message_with_tokens(new_msg)
 		last_msg = self.history.messages[-1]
 		logger.debug(
-			f'Added message with {last_msg.metadata.input_tokens} tokens - total tokens now: {self.history.total_tokens}/{self.max_input_tokens} - total messages: {len(self.history.messages)}'
+			f'Added message with {last_msg.metadata.input_tokens} tokens - total tokens now: '
+			f'{self.history.total_tokens}/{self.max_input_tokens} - total messages: '
+			f'{len(self.history.messages)}'
 		)
